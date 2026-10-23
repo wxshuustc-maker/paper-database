@@ -10,6 +10,8 @@ import 'package:paper_library/data/library.dart';
 import 'package:paper_library/import/online_lookup.dart';
 import 'package:paper_library/import/text_metadata.dart';
 import 'package:paper_library/models.dart';
+import 'package:paper_library/security/secret_store.dart';
+import 'package:paper_library/sync/sync_cipher.dart';
 import 'package:paper_library/sync/sync_engine.dart';
 import 'package:paper_library/sync/webdav.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -46,6 +48,15 @@ class MemoryRemote implements RemoteStore {
     versions[path] = 'v${++_v}';
     return null; // 模拟不返回 ETag 的服务器
   }
+
+  @override
+  Future<void> delete(String path) async {
+    final p = path.endsWith('/') ? path : '$path/';
+    files.removeWhere((k, _) => k.startsWith(p) || k == path);
+  }
+
+  /// 服务器上所有内容拼在一起，用来检查是否泄露明文。
+  String get everything => [...files.keys, ...files.values.map((v) => latin1.decode(v))].join('\n');
 }
 
 Future<Library> newLibrary(Directory tmp, String name) async {
@@ -240,6 +251,65 @@ DOI: 10.11897/SP.J.1016.2022.00001''';
       expect(down.filesDown, 1);
       await b.reload();
       expect(b.hasLocalFile(b.papers.single), isTrue);
+    });
+  });
+
+  group('隐私', () {
+    late Directory tmp;
+    setUp(() => tmp = Directory.systemTemp.createTempSync('pl'));
+    tearDown(() => tmp.deleteSync(recursive: true));
+
+    test('端到端加密同步：云端无明文，另一台设备用同一密码可解密', () async {
+      final remote = MemoryRemote();
+      final a = await newLibrary(tmp, 'a');
+      final b = await newLibrary(tmp, 'b');
+      final src = File('${tmp.path}/secret.pdf')..writeAsBytesSync(utf8.encode('%PDF-1.4 TOPSECRETBODY'));
+      final r = await a.importPdf(src.path, lookupOnline: false);
+      await a.savePaper(r.paper.copyWith(title: 'Confidential Title XYZ', note: '私密笔记内容'));
+      await a.saveAnnotation(Annotation(
+          id: 'n1', paperId: r.paper.id, page: 1, selectedText: 'quoted', note: '批注秘密', createdAt: 1, updatedAt: nowMs()));
+
+      final cipherA = await SyncCipher.setupRemote(remote, 'PaperLibrary/e2e', 'correct horse battery');
+      await SyncEngine(db: a.db, remote: remote, filesDir: a.filesDir, cipher: cipherA).run();
+
+      final all = remote.everything;
+      for (final secret in ['Confidential Title XYZ', '私密笔记内容', '批注秘密', 'TOPSECRETBODY', r.paper.id, r.paper.fileHash!]) {
+        expect(all.contains(secret), isFalse, reason: '云端不应出现明文：$secret');
+      }
+      expect(remote.files.keys.every((k) => k.startsWith('PaperLibrary/e2e/')), isTrue);
+
+      // 错误密码被拒绝
+      expect(() => SyncCipher.setupRemote(remote, 'PaperLibrary/e2e', 'wrong password'),
+          throwsA(isA<WrongPassphraseException>()));
+
+      // 正确密码能解密
+      final cipherB = await SyncCipher.setupRemote(remote, 'PaperLibrary/e2e', 'correct horse battery');
+      final rep = await SyncEngine(db: b.db, remote: remote, filesDir: b.filesDir, cipher: cipherB).run();
+      expect(rep.errors, isEmpty);
+      await b.reload();
+      expect(b.papers.single.title, 'Confidential Title XYZ');
+      expect((await b.annotationsOf(r.paper.id)).single.note, '批注秘密');
+      expect(utf8.decode(b.fileFor(b.papers.single).readAsBytesSync()), contains('TOPSECRETBODY'));
+
+      // 用缓存的原始密钥恢复的 cipher 与派生的一致
+      final restored = SyncCipher.fromRawKey(cipherB.rawKey);
+      expect(utf8.decode(await restored.decrypt(await cipherA.encrypt(utf8.encode('hi')))), 'hi');
+    });
+
+    test('篡改的密文无法解密', () async {
+      final c = await SyncCipher.derive('password123', List.filled(16, 1), 1000);
+      final data = await c.encrypt(utf8.encode('hello'));
+      data[20] ^= 0xFF;
+      expect(() => c.decrypt(data), throwsA(anything));
+    });
+
+    test('旧版明文密码迁移', () async {
+      sqfliteFfiInit();
+      final db = await LocalDatabase.open(databaseFactoryFfiNoIsolate, '${tmp.path}/m.db');
+      await db.setKv('webdav.pass', 'old-secret');
+      final store = await SecretStore.open(db, useSystemStore: false);
+      await store.migrateFromKv('webdav.pass', 'webdav.pass');
+      expect(await store.read('webdav.pass'), 'old-secret');
     });
   });
 }

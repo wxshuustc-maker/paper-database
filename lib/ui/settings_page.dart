@@ -11,6 +11,7 @@ class SettingsPage extends StatefulWidget {
 
 class _SettingsPageState extends State<SettingsPage> {
   late final TextEditingController _url, _user, _pass, _folder;
+  final _phrase = TextEditingController(), _phrase2 = TextEditingController();
   bool _syncFiles = true, _autoSync = true, _showPass = false, _busy = false;
   String? _message;
   bool _init = false;
@@ -53,6 +54,98 @@ class _SettingsPageState extends State<SettingsPage> {
         _message = msg;
       });
     }
+  }
+
+  Widget _e2eSetup(AppScope scope) {
+    final theme = Theme.of(context);
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text('端到端加密（未启用）', style: theme.textTheme.titleMedium),
+      const SizedBox(height: 4),
+      Text(
+        '启用后，论文信息、批注、手写笔记和 PDF 都会在本机加密（AES-256-GCM）后再上传，'
+        '坚果云 / NAS 上只有无法解读的密文，连文件名也看不出内容。\n'
+        '每台设备都要输入同一个同步密码。请牢记它：忘记后云端数据无法解密（本机数据不受影响，可重新设置）。',
+        style: theme.textTheme.bodySmall,
+      ),
+      const SizedBox(height: 8),
+      TextField(
+        controller: _phrase,
+        obscureText: true,
+        decoration: const InputDecoration(labelText: '同步密码（至少 8 位）', border: OutlineInputBorder()),
+      ),
+      const SizedBox(height: 8),
+      TextField(
+        controller: _phrase2,
+        obscureText: true,
+        decoration: const InputDecoration(
+            labelText: '再输入一次', helperText: '其他设备已启用加密时，这里输入相同的密码', border: OutlineInputBorder()),
+      ),
+      const SizedBox(height: 8),
+      FilledButton.icon(
+        icon: const Icon(Icons.lock_outline),
+        label: const Text('启用端到端加密'),
+        onPressed: _busy
+            ? null
+            : () {
+                if (_phrase.text != _phrase2.text) {
+                  setState(() => _message = '两次输入的同步密码不一致');
+                  return;
+                }
+                _run(() async {
+                  await _apply();
+                  final msg = await scope.sync.enableEncryption(_phrase.text);
+                  if (scope.sync.settings.e2e) {
+                    _phrase.clear();
+                    _phrase2.clear();
+                  }
+                  return msg;
+                });
+              },
+      ),
+    ]);
+  }
+
+  Widget _e2eEnabled(AppScope scope) {
+    final theme = Theme.of(context);
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        const Icon(Icons.lock, color: Colors.green),
+        const SizedBox(width: 8),
+        Text('端到端加密已启用', style: theme.textTheme.titleMedium),
+      ]),
+      const SizedBox(height: 4),
+      Text('数据加密后保存在云端的"${_folder.text.trim().isEmpty ? 'PaperLibrary' : _folder.text.trim()}/e2e"文件夹。'
+          '启用加密前上传过的明文数据仍在原位置，确认所有设备都已切换到加密后可以删除。',
+          style: theme.textTheme.bodySmall),
+      const SizedBox(height: 8),
+      Wrap(spacing: 12, runSpacing: 8, children: [
+        OutlinedButton.icon(
+          icon: const Icon(Icons.delete_sweep_outlined),
+          label: const Text('删除云端的明文数据'),
+          onPressed: _busy
+              ? null
+              : () async {
+                  final ok = await showDialog<bool>(
+                    context: context,
+                    builder: (ctx) => AlertDialog(
+                      title: const Text('删除云端明文数据？'),
+                      content: const Text('将删除 WebDAV 上未加密的 records 和 files 文件夹，无法撤销。'
+                          '请先确认你所有设备都已启用加密并同步过一次，否则未切换的设备会把明文重新传上来。'),
+                      actions: [
+                        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+                        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('删除')),
+                      ],
+                    ),
+                  );
+                  if (ok == true) _run(scope.sync.deletePlainRemoteData);
+                },
+        ),
+        TextButton(
+          onPressed: _busy ? null : () => _run(scope.sync.disableEncryption),
+          child: const Text('关闭加密'),
+        ),
+      ]),
+    ]);
   }
 
   @override
@@ -145,6 +238,27 @@ class _SettingsPageState extends State<SettingsPage> {
                 child: Text(scope.sync.status, style: theme.textTheme.bodySmall),
               ),
             ),
+            const Divider(height: 40),
+            Text('隐私与加密', style: theme.textTheme.titleLarge),
+            const SizedBox(height: 8),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: Icon(scope.sync.secrets.secure ? Icons.verified_user_outlined : Icons.warning_amber,
+                  color: scope.sync.secrets.secure ? Colors.green : Colors.orange),
+              title: Text(scope.sync.secrets.secure ? 'WebDAV 密码保存在系统安全存储中' : '此设备没有可用的系统安全存储'),
+              subtitle: Text(scope.sync.secrets.secure
+                  ? '安卓 Keystore / Windows 凭据管理器 / macOS 钥匙串 / Linux 钥匙环，其他应用无法读取'
+                  : '密码只能保存在应用的本地数据库中。Linux 上安装并解锁 GNOME 钥匙环或 KWallet 后重启应用即可改善'),
+            ),
+            const SizedBox(height: 8),
+            ListenableBuilder(
+              listenable: scope.sync,
+              builder: (context, _) => scope.sync.settings.e2e ? _e2eEnabled(scope) : _e2eSetup(scope),
+            ),
+            const SizedBox(height: 8),
+            Text('本机数据（论文库数据库和 PDF）存放在应用私有目录中，建议同时开启系统的磁盘加密'
+                '（安卓默认开启；Windows 用 BitLocker，macOS 用 FileVault）。',
+                style: theme.textTheme.bodySmall),
             const Divider(height: 40),
             Text('自动分类', style: theme.textTheme.titleLarge),
             const SizedBox(height: 4),

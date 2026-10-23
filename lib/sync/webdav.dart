@@ -35,6 +35,9 @@ abstract class RemoteStore {
   /// 上传文件，返回新版本号（服务器没给时返回 null）。
   Future<String?> put(String path, Uint8List data);
   Future<void> ensureDir(String dir);
+
+  /// 删除文件或整个目录（不存在时忽略）。
+  Future<void> delete(String path);
 }
 
 /// 精简的 WebDAV 客户端，只实现同步需要的 PROPFIND / GET / PUT / MKCOL。
@@ -132,6 +135,14 @@ class WebDavClient implements RemoteStore {
       await res.stream.drain<void>();
       if (res.statusCode == 401) throw WebDavException(401, p);
     }
+  }
+
+  @override
+  Future<void> delete(String path) async {
+    final res = await _send('DELETE', path);
+    await res.stream.drain<void>();
+    if (res.statusCode == 404) return;
+    if (res.statusCode < 200 || res.statusCode >= 300) throw WebDavException(res.statusCode, path);
   }
 
   /// 测试连接：列出根目录。

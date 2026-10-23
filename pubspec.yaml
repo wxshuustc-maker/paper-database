@@ -47,6 +47,9 @@ dependencies:
   crypto: ^3.0.7
   shared_preferences: ^2.5.6
   sqflite_common: ^2.5.14
+  flutter_secure_storage: ^11.2.0
+  cryptography: ^2.9.0
+  cryptography_flutter: ^2.3.4
 
 dev_dependencies:
   flutter_test:

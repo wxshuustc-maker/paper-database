@@ -15,6 +15,7 @@ import 'package:integration_test/integration_test.dart';
 import 'package:paper_library/data/database.dart';
 import 'package:paper_library/data/library.dart';
 import 'package:paper_library/main.dart';
+import 'package:paper_library/security/secret_store.dart';
 import 'package:paper_library/sync/sync_service.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -50,7 +51,7 @@ void main() {
     final db = await LocalDatabase.open(databaseFactoryFfi, '${tmp.path}/library.db');
     final lib = Library(db: db, filesDir: Directory('${tmp.path}/files'), pdfTextReader: readPdfText);
     await lib.init();
-    final sync = SyncService(lib);
+    final sync = SyncService(lib, await SecretStore.open(db, useSystemStore: false));
     await sync.load();
 
     final results = <ImportResult>[];
@@ -157,6 +158,11 @@ void main() {
     await t.tap(find.byType(BackButton));
     await wait(t, 800);
     await shot(t, '9_home_after');
+    await t.tap(find.byTooltip('设置'));
+    await wait(t, 800);
+    await t.scrollUntilVisible(find.text('启用端到端加密'), 300, scrollable: find.byType(Scrollable).first);
+    await wait(t, 500);
+    await shot(t, '10_settings_privacy');
     expect(results.length, greaterThan(0));
     expect(lib.papers.where((p) => p.categoryId != 'uncategorized'), isNotEmpty);
   });

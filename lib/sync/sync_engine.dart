@@ -2,8 +2,11 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
+
 import '../data/database.dart';
 import '../models.dart';
+import 'sync_cipher.dart';
 import 'webdav.dart';
 
 class SyncReport {
@@ -22,6 +25,7 @@ class SyncReport {
 
 /// 双向同步引擎。
 ///
+/// 传入 [cipher] 时启用端到端加密：所有数据放在 `<root>/e2e/` 下，内容加密、文件名经 HMAC 处理。
 /// 远端目录结构：
 /// ```
 /// <root>/records/<type>/<id>.json   每条记录一个 JSON 文件
@@ -37,19 +41,28 @@ class SyncEngine {
   /// 本地 PDF 所在目录。
   final Directory filesDir;
   final bool syncFiles;
+  final SyncCipher? cipher;
 
   SyncEngine({
     required this.db,
     required this.remote,
     required this.filesDir,
-    this.root = 'PaperLibrary',
+    String root = 'PaperLibrary',
     this.syncFiles = true,
-  });
+    this.cipher,
+  }) : root = cipher == null ? root : '$root/e2e';
 
   static const _types = [RecordType.category, RecordType.paper, RecordType.annotation, RecordType.ink];
 
   String _dir(RecordType t) => '$root/records/${t.name}';
-  String _kvPrefix(RecordType t) => 'sync.v.${t.name}/';
+  // 已知远端版本按"远端文件名（去掉扩展名）"记录；明文和加密模式分开记。
+  String _kvPrefix(RecordType t) => cipher == null ? 'sync.v.${t.name}/' : 'sync.e.${t.name}/';
+  String get _ext => cipher == null ? '.json' : '.enc';
+  String _remoteName(RecordType t, String id) => cipher == null ? id : cipher!.nameFor('${t.name}/$id');
+  String _remoteFileName(String hash) => cipher == null ? '$hash.pdf' : '${cipher!.nameFor('file/$hash')}.bin';
+
+  Future<Uint8List> _encode(Uint8List plain) async => cipher == null ? plain : await cipher!.encrypt(plain);
+  Future<Uint8List> _decode(Uint8List data) async => cipher == null ? data : await cipher!.decrypt(data);
 
   Future<SyncReport> run({void Function(String)? onProgress}) async {
     final report = SyncReport();
@@ -71,51 +84,53 @@ class SyncEngine {
     final known = await db.kvWithPrefix(_kvPrefix(type));
     final remoteEntries = {
       for (final e in await remote.list(dir))
-        if (!e.isDir && e.name.endsWith('.json')) e.name.substring(0, e.name.length - 5): e.version,
+        if (!e.isDir && e.name.endsWith(_ext)) e.name.substring(0, e.name.length - _ext.length): e.version,
     };
 
     // 1. 拉取远端有变化的记录。
-    for (final MapEntry(key: id, value: version) in remoteEntries.entries) {
-      if (known[id] == version) continue;
+    for (final MapEntry(key: name, value: version) in remoteEntries.entries) {
+      if (known[name] == version) continue;
       try {
-        final bytes = await remote.get('$dir/$id.json');
+        final bytes = await _decode(await remote.get('$dir/$name$_ext'));
         final incoming = recordFromString(type, utf8.decode(bytes));
-        final local = await db.getStored(type, id);
+        final local = await db.getStored(type, incoming.id);
         if (local == null || incoming.updatedAt > local.updatedAt) {
           await db.put(type, incoming, dirty: false);
           report.pulled++;
         } else if (incoming.updatedAt == local.updatedAt && local.dirty) {
-          await db.markClean(type, id, local.updatedAt);
+          await db.markClean(type, incoming.id, local.updatedAt);
         }
-        await db.setKv('${_kvPrefix(type)}$id', version);
+        await db.setKv('${_kvPrefix(type)}$name', version);
       } catch (e) {
-        report.errors.add('下载 $type/$id 失败：$e');
+        report.errors.add('下载 ${type.name}/$name 失败：$e');
       }
     }
 
     // 2. 推送本地修改。
     final pushedWithoutVersion = <String>[];
     for (final rec in await db.dirty(type)) {
+      final name = _remoteName(type, rec.id);
       try {
-        final version = await remote.put('$dir/${rec.id}.json', Uint8List.fromList(utf8.encode(rec.json)));
+        final body = await _encode(Uint8List.fromList(utf8.encode(rec.json)));
+        final version = await remote.put('$dir/$name$_ext', body);
         await db.markClean(type, rec.id, rec.updatedAt);
         if (version != null) {
-          await db.setKv('${_kvPrefix(type)}${rec.id}', version);
+          await db.setKv('${_kvPrefix(type)}$name', version);
         } else {
-          pushedWithoutVersion.add(rec.id);
+          pushedWithoutVersion.add(name);
         }
         report.pushed++;
       } catch (e) {
-        report.errors.add('上传 $type/${rec.id} 失败：$e');
+        report.errors.add('上传 ${type.name}/${rec.id} 失败：$e');
       }
     }
 
     // 3. 服务器没在 PUT 响应里给 ETag 时，重新列目录记下自己上传后的版本，避免下次重复下载。
     if (pushedWithoutVersion.isNotEmpty) {
       final fresh = {for (final e in await remote.list(dir)) e.name: e.version};
-      for (final id in pushedWithoutVersion) {
-        final v = fresh['$id.json'];
-        if (v != null) await db.setKv('${_kvPrefix(type)}$id', v);
+      for (final name in pushedWithoutVersion) {
+        final v = fresh['$name$_ext'];
+        if (v != null) await db.setKv('${_kvPrefix(type)}$name', v);
       }
     }
   }
@@ -127,22 +142,24 @@ class SyncEngine {
     final papers = await db.all<Paper>(RecordType.paper);
     final hashes = papers.map((p) => p.fileHash).whereType<String>().toSet();
     for (final hash in hashes) {
-      final name = '$hash.pdf';
-      final local = File('${filesDir.path}/$name');
+      final name = _remoteFileName(hash);
+      final local = File('${filesDir.path}/$hash.pdf');
       final localExists = await local.exists();
       try {
         if (localExists && !remoteFiles.contains(name)) {
-          await remote.put('$dir/$name', await local.readAsBytes());
+          await remote.put('$dir/$name', await _encode(await local.readAsBytes()));
           report.filesUp++;
         } else if (!localExists && remoteFiles.contains(name)) {
-          final bytes = await remote.get('$dir/$name');
+          final bytes = await _decode(await remote.get('$dir/$name'));
+          // 校验内容哈希，防止文件损坏或被篡改。
+          if (sha256.convert(bytes).toString() != hash) throw const FormatException('文件校验失败');
           final tmp = File('${local.path}.part');
           await tmp.writeAsBytes(bytes, flush: true);
           await tmp.rename(local.path);
           report.filesDown++;
         }
       } catch (e) {
-        report.errors.add('同步文件 $name 失败：$e');
+        report.errors.add('同步文件 $hash 失败：$e');
       }
     }
   }

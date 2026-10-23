@@ -9,6 +9,7 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'data/database.dart';
 import 'data/library.dart';
+import 'security/secret_store.dart';
 import 'sync/sync_service.dart';
 import 'ui/app_scope.dart';
 import 'ui/home_page.dart';
@@ -22,7 +23,7 @@ Future<void> main() async {
   final db = await LocalDatabase.open(databaseFactoryFfi, p.join(dir.path, 'library.db'));
   final library = Library(db: db, filesDir: Directory(p.join(dir.path, 'files')), pdfTextReader: readPdfText);
   await library.init();
-  final sync = SyncService(library);
+  final sync = SyncService(library, await SecretStore.open(db));
   await sync.load();
 
   runApp(PaperLibraryApp(library: library, sync: sync));

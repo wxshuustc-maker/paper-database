@@ -125,6 +125,12 @@ class LocalDatabase {
         where: 'type = ? AND id = ? AND updated_at = ?', whereArgs: [type.name, id, updatedAt]);
   }
 
+  /// 把所有记录标记为待上传（切换加密模式后需要把数据完整上传一遍）。
+  Future<void> markAllDirty() async {
+    // 内置分类（updatedAt=0）各设备本来就一致，不需要上传。
+    await db.update('records', {'dirty': 1}, where: 'updated_at > 0');
+  }
+
   StoredRecord _stored(Map<String, Object?> r) => StoredRecord(
         RecordType.values.byName(r['type'] as String),
         r['id'] as String,
